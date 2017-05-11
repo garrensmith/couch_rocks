@@ -17,4 +17,5 @@
 
 
 couch_rocks_test_()->
+    %test_engine_util:create_tests(couch_bt_engine).
     test_engine_util:create_tests(couch_rocks).
