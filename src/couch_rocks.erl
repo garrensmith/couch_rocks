@@ -14,12 +14,12 @@
 %-behavior(couch_db_engine).
 
 -export([
-    exists/1
+    exists/1,
 
     % delete/3,
     % delete_compaction_files/3,
 
-    % init/2,
+    init/2
     % terminate/2,
     % handle_call/2,
     % handle_info/2,
@@ -98,6 +98,7 @@
 
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_rocks.hrl").
+-include_lib("couch/include/couch_eunit.hrl").
 
 
 % -record(wiacc, {
@@ -110,10 +111,32 @@
 
 
 exists(DirPath) ->
-    CPFile = filename:join(DirPath, "COMMITS"),
-    io:format("BOOM ~p ~p ~n", [DirPath, CPFile]),
-    filelib:is_file(CPFile).
+    CPFile = DirPath ++ ".rocks",
+    ?debugFmt("Is file ~p ~p ~n", [CPFile, filelib:is_file(CPFile)]),
+    filelib:is_dir(CPFile).
 
+init(DirPath, Options) ->
+    CPFile = DirPath ++ ".rocks",
+    Create = lists:member(create, Options),
+    ?debugFmt("FOlder ~p ~p ~n", [DirPath, CPFile]),
+    case exists(DirPath) of 
+        false when Create =:= false -> 
+            throw({not_found, no_db_file});
+        false ->
+            open_db(CPFile, [{create_if_missing, true}]);
+        true when Create =:= true -> 
+            throw({error, eexist});
+        _ ->
+            open_db(CPFile, [])
+    end.
+
+open_db(File, Options) ->
+    case rocksdb:open(File, Options) of
+        {ok, DBHandle} -> {ok, DBHandle};
+        {error, _V} ->
+            ?debugFmt("ERROR ~p ~n", [_V]),
+            throw({error, _V})
+    end.
 
 % delete(RootDir, DirPath, Async) ->
 %     %% Delete any leftover compaction files. If we don't do this a
