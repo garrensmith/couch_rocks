@@ -13,36 +13,42 @@
 -module(couch_rocks).
 %-behavior(couch_db_engine).
 
+% TODO:
+% * Implement epochs for node
+% * Compaction seq 
+% * Only fsync on commit_data
+% * Disk size info
+
 -export([
     exists/1,
 
-    % delete/3,
+    delete/3,
     % delete_compaction_files/3,
 
-    init/2
-    % terminate/2,
-    % handle_call/2,
-    % handle_info/2,
+    init/2,
+    terminate/2,
+    handle_call/2,
+    handle_info/2,
 
     % incref/1,
     % decref/1,
     % monitored_by/1,
 
-    % get_compacted_seq/1,
-    % get_del_doc_count/1,
-    % get_disk_version/1,
-    % get_doc_count/1,
-    % get_epochs/1,
-    % get_last_purged/1,
-    % get_purge_seq/1,
-    % get_revs_limit/1,
-    % get_security/1,
-    % get_size_info/1,
-    % get_update_seq/1,
-    % get_uuid/1,
+    get_compacted_seq/1,
+    get_del_doc_count/1,
+    get_disk_version/1,
+    get_doc_count/1,
+    get_epochs/1,
+    get_last_purged/1,
+    get_purge_seq/1,
+    get_revs_limit/1,
+    get_security/1,
+    get_size_info/1,
+    get_update_seq/1,
+    get_uuid/1,
 
-    % set_revs_limit/2,
-    % set_security/2,
+    set_revs_limit/2,
+    set_security/2,
 
     % open_docs/2,
     % open_local_docs/2,
@@ -52,7 +58,7 @@
     % write_doc_body/2,
     % write_doc_infos/4,
 
-    % commit_data/1,
+    commit_data/1,
 
     % open_write_stream/2,
     % open_read_stream/2,
@@ -64,7 +70,7 @@
     % count_changes_since/2,
 
     % start_compaction/4,
-    % finish_compaction/4
+    finish_compaction/4
 ]).
 
 
@@ -100,7 +106,6 @@
 -include("couch_rocks.hrl").
 -include_lib("couch/include/couch_eunit.hrl").
 
-
 % -record(wiacc, {
 %     new_ids = [],
 %     rem_ids = [],
@@ -109,40 +114,90 @@
 %     update_seq
 % }).
 
+% Column family names
+-define(SEQ, "seq").
+-define(ID, "default"). %to open an existing db file with column families it seems to need a cf called default
+-define(META, "meta").
+-define(METABIN, <<"meta">>).
+
+-record(meta, {
+    disk_version= 1,
+    doc_count = 0,
+    deleted_doc_count = 0,
+    update_seq = 0,
+    purge_seq = 0,
+    security_options,
+    revs_limit = 1000,
+    uuid,
+    epochs,
+    compacted_seq = 0
+}).
+
 
 exists(DirPath) ->
     CPFile = DirPath ++ ".rocks",
-    ?debugFmt("Is file ~p ~p ~n", [CPFile, filelib:is_file(CPFile)]),
     filelib:is_dir(CPFile).
 
 init(DirPath, Options) ->
     CPFile = DirPath ++ ".rocks",
     Create = lists:member(create, Options),
-    ?debugFmt("FOlder ~p ~p ~n", [DirPath, CPFile]),
-    case exists(DirPath) of 
+    RocksDefaultOptions = [{create_if_missing, true}, {create_missing_column_families, true}],
+    {ok, State} = case exists(DirPath) of 
         false when Create =:= false -> 
             throw({not_found, no_db_file});
         false ->
-            open_db(CPFile, [{create_if_missing, true}]);
+            setup_new_db(CPFile, lists:append(Options, RocksDefaultOptions));
         true when Create =:= true -> 
             throw({error, eexist});
         _ ->
-            open_db(CPFile, [])
+            %{ok, DBHandle} = open_db(CPFile, []),
+            open_existing_db(CPFile, [])
+    end,
+    {ok, State}.
+
+% open_db(File, Options) ->
+%     case rocksdb:open(File, Options) of
+%         {ok, DBHandle} -> {ok, DBHandle};
+%         {error, V} -> throw({error, V})
+%     end.
+
+open_existing_db(File, Options) ->
+    case rocksdb:open_with_cf(File, Options, [{?ID, []}, {?SEQ, []}, {?META, []}]) of
+        {ok, DBHandle, [IdHandle, SeqHandle, MetaHandle]} ->
+            State = #state{
+                id_handle = IdHandle,
+                seq_handle = SeqHandle,
+                meta_handle = MetaHandle, 
+                db_handle = DBHandle
+                },
+            {ok, State};
+        Err -> 
+            throw(Err)
     end.
 
-open_db(File, Options) ->
-    case rocksdb:open(File, Options) of
-        {ok, DBHandle} -> {ok, DBHandle};
-        {error, _V} ->
-            ?debugFmt("ERROR ~p ~n", [_V]),
-            throw({error, _V})
-    end.
+setup_new_db(CPFile, Options) ->
+    % {ok, IdHandle} = rocksdb:create_column_family(DBHandle, ?ID, []),
+    % {ok, SeqHandle} = rocksdb:create_column_family(DBHandle, ?SEQ, []),
+    % {ok, MetaHandle} = rocksdb:create_column_family(DBHandle, ?META, []),
+    {ok, #state{db_handle = DBHandle, meta_handle = MetaHandle} = State} = open_existing_db(CPFile, Options),
+    SecurityOptions = couch_util:get_value(default_security_object, Options),
+    Meta = #meta{
+        security_options = SecurityOptions,
+        uuid = couch_uuids:random(),
+        epochs = [{node(), 0}]
+        },
+    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(Meta), [{sync, true}]) of
+            ok -> ok;
+            Err -> throw(Err)
+        end,
+    {ok, State}.
 
-% delete(RootDir, DirPath, Async) ->
-%     %% Delete any leftover compaction files. If we don't do this a
-%     %% subsequent request for this DB will try to open them to use
-%     %% as a recovery.
-%     couch_ngen_file:nuke_dir(RootDir, DirPath, Async).
+terminate(_Reason, #state{db_handle = DBHandle}) ->
+    rocksdb:close(DBHandle).
+
+delete(_RootDir, DirPath, _Options) ->
+    File = DirPath ++ ".rocks",
+    rocksdb:destroy(File, []).
 
 
 % delete_compaction_files(RootDir, DirPath, _DelOpts) ->
@@ -158,40 +213,12 @@ open_db(File, Options) ->
 %     end, nil).
 
 
-% init(DirPath, Options) ->
-%     {ok, CPFd, IdxFd, DataFd} = open_db_files(DirPath, Options),
-%     Header = case lists:member(create, Options) of
-%         true ->
-%             delete_compaction_files(DirPath),
-%             couch_ngen_header:new();
-%         false ->
-%             case read_header(CPFd, IdxFd) of
-%                 {ok, Header0} ->
-%                     Header0;
-%                 no_valid_header ->
-%                     delete_compaction_files(DirPath),
-%                     Header0 =  couch_ngen_header:new(),
-%                     ok = write_header(CPFd, IdxFd, Header0),
-%                     Header0
-%             end
-%     end,
-%     {ok, init_state(DirPath, CPFd, IdxFd, DataFd, Header, Options)}.
+handle_call(Msg, St) ->
+    {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
 
 
-% terminate(_Reason, St) ->
-%     lists:foreach(fun(Fd) ->
-%         catch couch_ngen_file:close(Fd),
-%         couch_util:shutdown_sync(Fd)
-%     end, [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]),
-%     ok.
-
-
-% handle_call(Msg, St) ->
-%     {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
-
-
-% handle_info({'DOWN', _, _, _, _}, St) ->
-%     {stop, normal, St}.
+handle_info({'DOWN', _, _, _, _}, St) ->
+    {stop, normal, St}.
 
 
 % incref(St) ->
@@ -216,82 +243,72 @@ open_db(File, Options) ->
 %     end, [], [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]).
 
 
-% get_compacted_seq(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, compacted_seq).
+get_compacted_seq(State) ->
+    #meta{compacted_seq = CompactSeq} = get_meta_info(State),
+    CompactSeq.
 
 
-% get_del_doc_count(#st{} = St) ->
-%     {ok, {_, DelCount, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
-%     DelCount.
+get_del_doc_count(State) ->
+    #meta{deleted_doc_count = DelDocCount} = get_meta_info(State),
+    DelDocCount.
 
 
-% get_disk_version(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, disk_version).
+get_disk_version(State) ->
+    #meta{disk_version = DiskVersion} = get_meta_info(State),
+    DiskVersion.
 
 
-% get_doc_count(#st{} = St) ->
-%     {ok, {Count, _, _}} = couch_ngen_btree:full_reduce(St#st.id_tree),
-%     Count.
+get_doc_count(State) ->
+    #meta{doc_count = DocCount} = get_meta_info(State),
+    DocCount.
+
+get_meta_info(#state{db_handle = DBHandle, meta_handle = MetaHandle}) ->
+    case rocksdb:get(DBHandle, MetaHandle, ?METABIN, []) of
+        {ok, BinaryMeta} -> binary_to_term(BinaryMeta);
+        Err -> throw(Err)
+     end.
 
 
-% get_epochs(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, epochs).
+
+get_epochs(State) ->
+    #meta{epochs = Epochs} = get_meta_info(State),
+    Epochs.
 
 
-% get_last_purged(#st{header = Header} = St) ->
-%     case couch_ngen_header:get(Header, purged_docs, nil) of
-%         nil ->
-%             [];
-%         Pointer ->
-%             {ok, Purged} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
-%             Purged
-%     end.
+get_last_purged(_State) ->
+    [].
+
+get_purge_seq(State) ->
+    #meta{purge_seq = PurgeSeq} = get_meta_info(State),
+    PurgeSeq.
 
 
-% get_purge_seq(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, purge_seq).
+get_revs_limit(State) ->
+    #meta{revs_limit = RevsLimit} = get_meta_info(State),
+    RevsLimit.
 
 
-% get_revs_limit(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, revs_limit).
+get_security(State) ->
+    #meta{security_options = SecurityOptions} = get_meta_info(State),
+    SecurityOptions.
 
 
-% get_security(#st{header = Header} = St) ->
-%     Pointer = couch_ngen_header:get(Header, security_ptr),
-%     {ok, SecProps} = couch_ngen_file:read_term(St#st.data_fd, Pointer),
-%     SecProps.
+get_size_info(_State) ->
+    [
+        {active, 0},
+        {external, 0},
+        {file, 0}
+    ].
 
 
-% get_size_info(#st{} = St) ->
-%     {ok, IdxSize} = couch_ngen_file:bytes(St#st.idx_fd),
-%     {ok, DataSize} = couch_ngen_file:bytes(St#st.data_fd),
-%     FileSize = IdxSize + DataSize,
-
-%     {ok, DbReduction} = couch_ngen_btree:full_reduce(St#st.id_tree),
-%     SizeInfo0 = element(3, DbReduction),
-%     SizeInfo = case SizeInfo0 of
-%         SI when is_record(SI, size_info) ->
-%             SI;
-%         {AS, ES} ->
-%             #size_info{active=AS, external=ES};
-%         AS ->
-%             #size_info{active=AS}
-%     end,
-%     ActiveSize = active_size(St, SizeInfo),
-%     ExternalSize = SizeInfo#size_info.external,
-%     [
-%         {active, ActiveSize},
-%         {external, ExternalSize},
-%         {file, FileSize}
-%     ].
+get_update_seq(State) ->
+    #meta{update_seq = UpdateSeq} = get_meta_info(State),
+    UpdateSeq.
 
 
-% get_update_seq(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, update_seq).
-
-
-% get_uuid(#st{header = Header}) ->
-%     couch_ngen_header:get(Header, uuid).
+get_uuid(State) ->
+    #meta{uuid = UUID} = get_meta_info(State),
+    UUID.
 
 
 % set_revs_limit(#st{header = Header} = St, RevsLimit) ->
@@ -302,8 +319,26 @@ open_db(File, Options) ->
 %         needs_commit = true
 %     },
 %     {ok, increment_update_seq(NewSt)}.
+set_revs_limit(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, RevsLimit) ->
+    Meta = get_meta_info(State),
+    NewMeta = Meta#meta{
+        revs_limit = RevsLimit
+    },
+    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(NewMeta), [{sync, true}]) of
+        ok -> {ok, State};
+        Err -> throw(Err)
+    end.
 
 
+set_security(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, NewSecurity) ->
+    Meta = get_meta_info(State),
+    NewMeta = Meta#meta{
+        security_options = NewSecurity
+    },
+    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(NewMeta), [{sync, true}]) of
+        ok -> {ok, State};
+        Err -> throw(Err)
+    end.
 % set_security(#st{header = Header} = St, NewSecurity) ->
 %     {ok, Ptr} = couch_ngen_file:append_term(St#st.data_fd, NewSecurity),
 %     NewSt = St#st{
@@ -422,7 +457,8 @@ open_db(File, Options) ->
 %     }}.
 
 
-% commit_data(St) ->
+commit_data(St) ->
+    {ok, St}.
 %     #st{
 %         fsync_options = FsyncOptions,
 %         header = OldHeader,
@@ -503,7 +539,8 @@ open_db(File, Options) ->
 %     Pid = spawn_link(couch_ngen_compactor, start, Args),
 %     {ok, St, Pid}.
 
-
+finish_compaction(_S, _D, _O, _D) ->
+    ok.
 % finish_compaction(SrcSt, DbName, Options, DirPath) ->
 %     {ok, TgtSt1} = ?MODULE:init(DirPath, [compactor | Options]),
 %     SrcSeq = get_update_seq(SrcSt),
