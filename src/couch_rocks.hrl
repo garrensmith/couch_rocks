@@ -10,18 +10,37 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
--record(st, {
-    dirpath,
-    cp_fd,
-    idx_fd,
-    data_fd,
-    fd_monitors,
-    fsync_options,
-    header,
-    needs_commit,
-    id_tree,
-    seq_tree,
-    local_tree,
-    compression
+% -record(st, {
+%     dirpath,
+%     cp_fd,
+%     idx_fd,
+%     data_fd,
+%     fd_monitors,
+%     fsync_options,
+%     header,
+%     needs_commit,
+%     id_tree,
+%     seq_tree,
+%     local_tree,
+%     compression
+% }).
+
+-record(state, {
+    db_handle,
+    id_handle,
+    seq_handle,
+    meta_handle,
+    file_name
+    % cp_fd,
+    % idx_fd,
+    % data_fd,
+    % fd_monitors,
+    % fsync_options,
+    % header,
+    % needs_commit,
+    % id_tree,
+    % seq_tree,
+    % local_tree,
+    % compression
 }).
 

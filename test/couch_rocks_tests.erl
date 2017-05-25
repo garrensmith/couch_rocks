@@ -11,10 +11,7 @@
 % the License.
 
 -module(couch_rocks_tests).
-
-
 -include_lib("eunit/include/eunit.hrl").
-
 
 couch_rocks_test_()->
     %test_engine_util:create_tests(couch_bt_engine).
