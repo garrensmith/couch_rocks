@@ -50,13 +50,13 @@
     set_revs_limit/2,
     set_security/2,
 
-    % open_docs/2,
-    % open_local_docs/2,
-    % read_doc_body/2,
+    open_docs/2,
+    open_local_docs/2,
+    read_doc_body/2,
 
-    % serialize_doc/2,
-    % write_doc_body/2,
-    % write_doc_infos/4,
+    serialize_doc/2,
+    write_doc_body/2,
+    write_doc_infos/4,
 
     commit_data/1,
 
@@ -106,23 +106,24 @@
 -include("couch_rocks.hrl").
 -include_lib("couch/include/couch_eunit.hrl").
 
-% -record(wiacc, {
-%     new_ids = [],
-%     rem_ids = [],
-%     new_seqs = [],
-%     rem_seqs = [],
-%     update_seq
-% }).
+-record(wiacc, {
+    new_ids = [],
+    rem_ids = [],
+    new_seqs = [],
+    rem_seqs = [],
+    update_seq
+}).
 
 % Column family names
 -define(SEQ, "seq").
+-define(LOCAL, "local").
 -define(ID, "default"). %to open an existing db file with column families it seems to need a cf called default
 -define(META, "meta").
+-define(DOC, "doc").
 -define(METABIN, <<"meta">>).
 
 -record(meta, {
     disk_version= 1,
-    doc_count = 0,
     deleted_doc_count = 0,
     update_seq = 0,
     purge_seq = 0,
@@ -150,25 +151,20 @@ init(DirPath, Options) ->
         true when Create =:= true -> 
             throw({error, eexist});
         _ ->
-            %{ok, DBHandle} = open_db(CPFile, []),
             open_existing_db(CPFile, [])
     end,
     {ok, State}.
 
-% open_db(File, Options) ->
-%     case rocksdb:open(File, Options) of
-%         {ok, DBHandle} -> {ok, DBHandle};
-%         {error, V} -> throw({error, V})
-%     end.
-
 open_existing_db(File, Options) ->
-    case rocksdb:open_with_cf(File, Options, [{?ID, []}, {?SEQ, []}, {?META, []}]) of
-        {ok, DBHandle, [IdHandle, SeqHandle, MetaHandle]} ->
+    case rocksdb:open_with_cf(File, Options, [{?ID, []}, {?SEQ, []}, {?LOCAL, []}, {?META, []}, {?DOC, []}]) of
+        {ok, DBHandle, [IdHandle, SeqHandle, LocalHandle, MetaHandle, DocHandle]} ->
             State = #state{
                 id_handle = IdHandle,
                 seq_handle = SeqHandle,
+                local_handle = LocalHandle,
                 meta_handle = MetaHandle, 
-                db_handle = DBHandle
+                db_handle = DBHandle,
+                doc_handle = DocHandle
                 },
             {ok, State};
         Err -> 
@@ -176,9 +172,6 @@ open_existing_db(File, Options) ->
     end.
 
 setup_new_db(CPFile, Options) ->
-    % {ok, IdHandle} = rocksdb:create_column_family(DBHandle, ?ID, []),
-    % {ok, SeqHandle} = rocksdb:create_column_family(DBHandle, ?SEQ, []),
-    % {ok, MetaHandle} = rocksdb:create_column_family(DBHandle, ?META, []),
     {ok, #state{db_handle = DBHandle, meta_handle = MetaHandle} = State} = open_existing_db(CPFile, Options),
     SecurityOptions = couch_util:get_value(default_security_object, Options),
     Meta = #meta{
@@ -248,9 +241,18 @@ get_compacted_seq(State) ->
     CompactSeq.
 
 
-get_del_doc_count(State) ->
-    #meta{deleted_doc_count = DelDocCount} = get_meta_info(State),
-    DelDocCount.
+% This could get really slow. We could optimise by keeping this count in meta
+% and manually counting as updates/deletes happen
+get_del_doc_count(#state{db_handle = DBHandle}) ->
+    rocksdb:fold(DBHandle, fun({Key, BinBody}, Acc) ->
+        #full_doc_info {
+            deleted = Deleted
+        } = binary_to_term(BinBody),
+        case Deleted of
+            true -> Acc + 1;
+            _ -> Acc
+        end
+    end, 0, []).
 
 
 get_disk_version(State) ->
@@ -258,9 +260,18 @@ get_disk_version(State) ->
     DiskVersion.
 
 
-get_doc_count(State) ->
-    #meta{doc_count = DocCount} = get_meta_info(State),
-    DocCount.
+% This could get really slow. We could optimise by keeping this count in meta
+% and manually counting as updates/deletes happen
+get_doc_count(#state{db_handle = DBHandle}) ->
+    rocksdb:fold(DBHandle, fun({Key, BinBody}, Acc) ->
+        #full_doc_info {
+            deleted = Deleted
+        } = binary_to_term(BinBody),
+        case Deleted of
+            true -> Acc;
+            _ -> Acc + 1
+        end
+    end, 0, []).
 
 get_meta_info(#state{db_handle = DBHandle, meta_handle = MetaHandle}) ->
     case rocksdb:get(DBHandle, MetaHandle, ?METABIN, []) of
@@ -319,26 +330,27 @@ get_uuid(State) ->
 %         needs_commit = true
 %     },
 %     {ok, increment_update_seq(NewSt)}.
-set_revs_limit(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, RevsLimit) ->
+save_meta(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, NewMeta) ->
+    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(NewMeta), [{sync, true}]) of
+        ok -> {ok, State};
+        Err -> throw(Err)
+    end.
+
+
+set_revs_limit(State, RevsLimit) ->
     Meta = get_meta_info(State),
     NewMeta = Meta#meta{
         revs_limit = RevsLimit
     },
-    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(NewMeta), [{sync, true}]) of
-        ok -> {ok, State};
-        Err -> throw(Err)
-    end.
+    save_meta(State, NewMeta).
 
 
-set_security(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, NewSecurity) ->
+set_security(State, NewSecurity) ->
     Meta = get_meta_info(State),
     NewMeta = Meta#meta{
         security_options = NewSecurity
     },
-    case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(NewMeta), [{sync, true}]) of
-        ok -> {ok, State};
-        Err -> throw(Err)
-    end.
+    save_meta(State, NewMeta).
 % set_security(#st{header = Header} = St, NewSecurity) ->
 %     {ok, Ptr} = couch_ngen_file:append_term(St#st.data_fd, NewSecurity),
 %     NewSt = St#st{
@@ -349,25 +361,23 @@ set_security(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, New
 %     },
 %     {ok, increment_update_seq(NewSt)}.
 
-
-% open_docs(#st{} = St, DocIds) ->
-%     Results = couch_ngen_btree:lookup(St#st.id_tree, DocIds),
-%     lists:map(fun
-%         ({ok, FDI}) ->
-%             FDI;
-%         (not_found) ->
-%             not_found
-%     end, Results).
+open_doc(DBHandle, CFHandle, Id, Options) ->
+    case rocksdb:get(DBHandle, CFHandle, term_to_binary(Id), Options) of 
+        {ok, FDI} -> binary_to_term(FDI);
+        not_found -> not_found;
+        {err, Err} -> throw(Err)
+    end.
 
 
-% open_local_docs(#st{} = St, DocIds) ->
-%     Results = couch_ngen_btree:lookup(St#st.local_tree, DocIds),
-%     lists:map(fun
-%         ({ok, Doc}) ->
-%             Doc;
-%         (not_found) ->
-%             not_found
-%     end, Results).
+open_docs(#state{db_handle = DBHandle, id_handle = IDHandle}, DocIds) ->
+    lists:map(fun (Id) -> 
+        open_doc(DBHandle, IDHandle, Id, []) 
+    end, DocIds).
+
+open_local_docs(#state{db_handle = DBHandle, local_handle = LocalHandle}, DocIds) ->
+    lists:map(fun (Id) -> 
+        open_doc(DBHandle, LocalHandle, Id, []) 
+    end, DocIds).
 
 
 % read_doc_body(#st{} = St, #doc{} = Doc) ->
@@ -384,40 +394,69 @@ set_security(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, New
 %     end.
 
 
-% serialize_doc(#st{} = St, #doc{} = Doc) ->
-%     Compress = fun(Term) ->
-%         case couch_compress:is_compressed(Term, St#st.compression) of
-%             true -> Term;
-%             false -> couch_compress:compress(Term, St#st.compression)
-%         end
-%     end,
-%     Body = Compress(Doc#doc.body),
-%     Atts = Compress(Doc#doc.atts),
-%     Doc#doc{body = ?term_to_bin({Body, Atts})}.
+% We won't do any compression here, and rather let Rocksdb do that for us
+serialize_doc(_State, Doc) ->
+    Doc.
 
 
-% write_doc_body(#st{} = St, #doc{} = Doc) ->
-%     #st{
-%         data_fd = Fd
-%     } = St,
-%     {ok, {_Pos, Len} = Ptr} = couch_ngen_file:append_bin(Fd, Doc#doc.body),
-%     {ok, Doc#doc{body = Ptr}, Len}.
+write_doc_body(#state{db_handle = DBHandle, doc_handle = DocHandle}, #doc{id = Id} = Doc) ->
+    BodyBin = term_to_binary(Doc),
+    case rocksdb:put(DBHandle, DocHandle, term_to_binary(Id), BodyBin, []) of 
+        ok -> {
+            ok,
+            Doc,
+            byte_size(BodyBin)
+        };
+        {err, Err} -> throw(Err)
+    end.
+
+read_doc_body(#state{db_handle = DBHandle, doc_handle = DocHandle}, #doc{id = Id} = Doc) ->
+    case rocksdb:get(DBHandle, DocHandle, term_to_binary(Id), []) of
+        {ok, BinDoc} -> binary_to_term(BinDoc);
+        {error, Err} -> throw(Err)
+    end.
 
 
-% write_doc_infos(#st{} = St, Pairs, LocalDocs, PurgeInfo) ->
-%     #st{
-%         id_tree = IdTree,
-%         seq_tree = SeqTree,
-%         local_tree = LocalTree
-%     } = St,
+write_doc_infos(#state{} = State, Pairs, LocalDocs, PurgeInfo) ->
+    #state{
+        db_handle = DBHandle,
+        id_handle = IDHandle,
+        seq_handle = SeqHandle,
+        local_handle = LocalHandle
+    } = State,
+    #wiacc{
+        new_ids = NewIds,
+        rem_ids = RemIds,
+        new_seqs = NewSeqs,
+        rem_seqs = RemSeqs,
+        update_seq = NewSeq
+    } = get_write_info(State, Pairs),
 
-%     #wiacc{
-%         new_ids = NewIds,
-%         rem_ids = RemIds,
-%         new_seqs = NewSeqs,
-%         rem_seqs = RemSeqs,
-%         update_seq = NewSeq
-%     } = get_write_info(St, Pairs),
+    {AddLDocs, RemLDocIds} = lists:foldl(fun(Doc, {AddAcc, RemAcc}) ->
+        case Doc#doc.deleted of
+            true ->
+                {AddAcc, [Doc#doc.id | RemAcc]};
+            false ->
+                {[{Doc#doc.id, Doc} | AddAcc], RemAcc}
+        end
+    end, {[], []}, LocalDocs),
+
+    add_remove(DBHandle, IDHandle, NewIds, RemIds),
+    add_remove(DBHandle, SeqHandle, NewSeqs, RemSeqs),
+    add_remove(DBHandle, LocalHandle, AddLDocs, RemLDocIds),
+
+    Meta = get_meta_info(State),
+
+    #meta{
+        deleted_doc_count = DelDocCount
+    } = Meta,
+    NewMeta = Meta#meta{
+        deleted_doc_count = DelDocCount + length(RemIds),
+        update_seq = NewSeq
+    },
+    save_meta(State, NewMeta),
+    {ok, State}.
+    
 
 %     {ok, IdTree2} = couch_ngen_btree:add_remove(IdTree, NewIds, RemIds),
 %     {ok, SeqTree2} = couch_ngen_btree:add_remove(SeqTree, NewSeqs, RemSeqs),
@@ -455,6 +494,14 @@ set_security(#state{db_handle = DBHandle, meta_handle = MetaHandle} = State, New
 %         local_tree = LocalTree2,
 %         needs_commit = true
 %     }}.
+add_remove(DBHandle, CFHandle, NewKeyValues, RemoveKeys) ->
+    lists:foreach(fun(Key) ->
+        ok = rocksdb:delete(DBHandle, CFHandle, term_to_binary(Key), [])
+    end, RemoveKeys),
+
+    lists:foreach(fun({Key, Value}) ->
+        ok = rocksdb:put(DBHandle, CFHandle, term_to_binary(Key), term_to_binary(Value), [])
+    end, NewKeyValues).
 
 
 commit_data(St) ->
@@ -834,65 +881,60 @@ finish_compaction(_S, _D, _O, _D) ->
 %     delete_compaction_files(RootDir, DirPath, []).
 
 
-% get_write_info(St, Pairs) ->
-%     Acc = #wiacc{update_seq = get_update_seq(St)},
-%     get_write_info(St, Pairs, Acc).
+get_write_info(St, Pairs) ->
+    Acc = #wiacc{update_seq = get_update_seq(St)},
+    get_write_info(St, Pairs, Acc).
 
 
-% get_write_info(_St, [], Acc) ->
-%     Acc;
+get_write_info(_St, [], Acc) ->
+    Acc;
 
-% get_write_info(St, [{OldFDI, NewFDI} | Rest], Acc) ->
-%     NewAcc = case {OldFDI, NewFDI} of
-%         {not_found, #full_doc_info{}} ->
-%             #full_doc_info{
-%                 id = Id,
-%                 update_seq = Seq
-%             } = NewFDI,
-%             {ok, Ptr} = write_doc_info(St, NewFDI),
-%             Acc#wiacc{
-%                 new_ids = [{Id, Ptr} | Acc#wiacc.new_ids],
-%                 new_seqs = [{Seq, Ptr} | Acc#wiacc.new_seqs],
-%                 update_seq = erlang:max(Seq, Acc#wiacc.update_seq)
-%             };
-%         {#full_doc_info{id = Id}, #full_doc_info{id = Id}} ->
-%             #full_doc_info{
-%                 update_seq = OldSeq
-%             } = OldFDI,
-%             #full_doc_info{
-%                 update_seq = NewSeq
-%             } = NewFDI,
-%             {ok, Ptr} = write_doc_info(St, NewFDI),
-%             Acc#wiacc{
-%                 new_ids = [{Id, Ptr} | Acc#wiacc.new_ids],
-%                 new_seqs = [{NewSeq, Ptr} | Acc#wiacc.new_seqs],
-%                 rem_seqs = [OldSeq | Acc#wiacc.rem_seqs],
-%                 update_seq = erlang:max(NewSeq, Acc#wiacc.update_seq)
-%             };
-%         {#full_doc_info{}, not_found} ->
-%             #full_doc_info{
-%                 id = Id,
-%                 update_seq = Seq
-%             } = OldFDI,
-%             Acc#wiacc{
-%                 rem_ids = [Id | Acc#wiacc.rem_ids],
-%                 rem_seqs = [Seq | Acc#wiacc.rem_seqs]
-%             }
-%     end,
-%     get_write_info(St, Rest, NewAcc).
+get_write_info(St, [{OldFDI, NewFDI} | Rest], Acc) ->
+    NewAcc = case {OldFDI, NewFDI} of
+        {not_found, #full_doc_info{}} ->
+            #full_doc_info{
+                id = Id,
+                update_seq = Seq
+            } = NewFDI,
+            ok = write_doc_info(St, NewFDI),
+            Acc#wiacc{
+                new_ids = [{Id, NewFDI} | Acc#wiacc.new_ids],
+                new_seqs = [{Seq, NewFDI} | Acc#wiacc.new_seqs],
+                update_seq = erlang:max(Seq, Acc#wiacc.update_seq)
+            };
+        {#full_doc_info{id = Id}, #full_doc_info{id = Id}} ->
+            #full_doc_info{
+                update_seq = OldSeq
+            } = OldFDI,
+            #full_doc_info{
+                update_seq = NewSeq
+            } = NewFDI,
+            ok = write_doc_info(St, NewFDI),
+            Acc#wiacc{
+                new_ids = [{Id, NewFDI} | Acc#wiacc.new_ids],
+                new_seqs = [{NewSeq, NewFDI} | Acc#wiacc.new_seqs],
+                rem_seqs = [OldSeq | Acc#wiacc.rem_seqs],
+                update_seq = erlang:max(NewSeq, Acc#wiacc.update_seq)
+            };
+        {#full_doc_info{}, not_found} ->
+            #full_doc_info{
+                id = Id,
+                update_seq = Seq
+            } = OldFDI,
+            Acc#wiacc{
+                rem_ids = [Id | Acc#wiacc.rem_ids],
+                rem_seqs = [Seq | Acc#wiacc.rem_seqs]
+            }
+    end,
+    get_write_info(St, Rest, NewAcc).
 
 
-% write_doc_info(St, FDI) ->
-%     #full_doc_info{
-%         id = Id,
-%         update_seq = Seq,
-%         deleted = Deleted,
-%         sizes = SizeInfo,
-%         rev_tree = Tree
-%     } = FDI,
-%     DataFd = St#st.data_fd,
-%     DiskTerm = {Id, Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree)},
-%     couch_ngen_file:append_term(DataFd, DiskTerm).
+write_doc_info(State, #full_doc_info{id = Id} = FDI) ->
+    ok.
+    % case rocksdb:put(DBHandle, DocHandle, term_to_binary(Id), term_to_binary(FDI), []) of 
+    %     ok -> ok;
+    %     {err, Err} -> throw(Err)
+    % end.
 
 
 % rev_tree(DiskTree) ->
