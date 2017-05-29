@@ -30,6 +30,8 @@
     id_handle,
     seq_handle,
     meta_handle,
+    local_handle,
+    doc_handle,
     file_name
     % cp_fd,
     % idx_fd,
