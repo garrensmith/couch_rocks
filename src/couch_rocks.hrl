@@ -32,17 +32,7 @@
     meta_handle,
     local_handle,
     doc_handle,
-    file_name
-    % cp_fd,
-    % idx_fd,
-    % data_fd,
-    % fd_monitors,
-    % fsync_options,
-    % header,
-    % needs_commit,
-    % id_tree,
-    % seq_tree,
-    % local_tree,
-    % compression
+    file_name,
+    meta
 }).
 
