@@ -66,8 +66,8 @@
 
     fold_docs/4,
     fold_local_docs/4,
-    % fold_changes/5,
-    % count_changes_since/2,
+    fold_changes/5,
+    count_changes_since/2,
 
     % start_compaction/4,
     finish_compaction/4
@@ -452,7 +452,12 @@ write_doc_infos(#state{} = State, Pairs, LocalDocs, _PurgeInfo) ->
             true ->
                 {AddAcc, [Doc#doc.id | RemAcc]};
             false ->
-                {[{Doc#doc.id, Doc} | AddAcc], RemAcc}
+                #doc{revs = {0, [RevInt | _]}} = Doc,
+                RevBin = integer_to_binary(RevInt),
+                Doc1 = Doc#doc{
+                    revs = {0, [RevBin]}
+                },
+                {[{Doc1#doc.id, Doc1} | AddAcc], RemAcc}
         end
     end, {[], []}, LocalDocs),
 
@@ -529,23 +534,47 @@ fold_docs(#state{db_handle = DBHandle, id_handle = IDHandle}, UserFun, UserAcc, 
 fold_local_docs(#state{db_handle = DBHandle, local_handle = LocalHandle}, UserFun, UserAcc, Options) ->
     fold_docs_int(DBHandle, LocalHandle, UserFun, UserAcc, Options).
 
-% fold_changes(St, SinceSeq, UserFun, UserAcc, Options) ->
-%     Fun = fun drop_reductions/4,
-%     InAcc = {UserFun, UserAcc},
-%     Opts = [{start_key, SinceSeq + 1}] ++ Options,
-%     {ok, _, OutAcc} = couch_ngen_btree:fold(St#st.seq_tree, Fun, InAcc, Opts),
-%     {_, FinalUserAcc} = OutAcc,
-%     {ok, FinalUserAcc}.
+
+ fold_changes(#state{db_handle = DBHandle, seq_handle = SeqHandle}, SinceSeq, UserFun, UserAcc, Options) ->
+    {Start, Direction} = case lists:member({dir, rev}, Options) of
+        true -> {{seek_for_prev, term_to_binary(SinceSeq + 1)}, prev};
+        _ -> {{seek, term_to_binary(SinceSeq + 1)}, next}
+    end,
+    case rocksdb:snapshot(DBHandle) of 
+        {error, Err} -> 
+            throw(Err);
+        {ok, Snapshot} ->
+            case rocksdb:iterator(DBHandle, SeqHandle, [{snapshot, Snapshot}]) of
+                {ok, Iter} ->
+                    try
+                        fold_seq_loop(rocksdb:iterator_move(Iter, Start), Iter, Direction, SinceSeq, UserFun, UserAcc)
+                    after
+                        rocksdb:release_snapshot(Snapshot),
+                        rocksdb:iterator_close(Iter)
+                    end;
+
+                {error, Err} ->
+                    throw(Err)
+            end
+    end.
 
 
-% count_changes_since(St, SinceSeq) ->
-%     BTree = St#st.seq_tree,
-%     FoldFun = fun(_SeqStart, PartialReds, 0) ->
-%         {ok, couch_ngen_btree:final_reduce(BTree, PartialReds)}
-%     end,
-%     Opts = [{start_key, SinceSeq + 1}],
-%     {ok, Changes} = couch_ngen_btree:fold_reduce(BTree, FoldFun, 0, Opts),
-%     Changes.
+fold_seq_loop({error, iterator_closed}, _Iter, _Direction, _StartKey, _Fun, Acc0) ->
+    throw({iterator_closed, Acc0});
+fold_seq_loop({error, invalid_iterator}, _Iter, _Fun, _Direction, _StartKey, Acc0) ->
+    {ok, Acc0};
+fold_seq_loop({ok, _Key, Value}, Iter, Direction, StartKey, Fun, Acc0) ->
+    {ok, OutAcc} = Fun(binary_to_term(Value), Acc0),
+    fold_seq_loop(
+        rocksdb:iterator_move(Iter, Direction), Iter, Direction, StartKey, Fun, OutAcc).
+
+
+
+count_changes_since(State, SinceSeq) ->
+    FoldFun = fun(_Doc, Acc) -> {ok, Acc + 1} end,
+    {ok, ChangesSince} = fold_changes(State, SinceSeq, FoldFun, 0, []),
+    ChangesSince.
+
 
 
 % start_compaction(St, DbName, Options, Parent) ->
@@ -766,7 +795,7 @@ fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
     end,
 
     FoldFun = case lists:member(include_deleted, Options) of
-        true -> UserAcc;
+        true -> UserFun;
         false when Reduce =:= true -> skip_deleted_with_reduce(UserFun);
         false when Reduce =:= false -> skip_deleted(UserFun)
     end,
@@ -785,7 +814,8 @@ fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
                         {ok, Acc}
                 end
             after
-                ?debugFmt("ITER ~p ~p ~n", [Iter, rocksdb:iterator_close(Iter)])
+                rocksdb:iterator_move(Iter, next),
+                rocksdb:iterator_close(Iter)
             end;
 
         {error, Err} ->
