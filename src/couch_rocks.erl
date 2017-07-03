@@ -131,7 +131,8 @@
     revs_limit = 1000,
     uuid,
     epochs,
-    compacted_seq = 0
+    compacted_seq = 0,
+    last_purged = []
 }).
 
 
@@ -316,12 +317,14 @@ get_epochs(State) ->
     Epochs.
 
 
-get_last_purged(_State) ->
-    [].
+get_last_purged(State) ->
+    #meta{last_purged = LastPurged} = get_meta_info(State),
+    LastPurged.
 
 get_purge_seq(State) ->
     #meta{purge_seq = PurgeSeq} = get_meta_info(State),
     PurgeSeq.
+
 
 
 get_revs_limit(State) ->
@@ -430,7 +433,7 @@ read_doc_body(#state{db_handle = DBHandle, doc_handle = DocHandle}, #doc{id = Id
     end.
 
 
-write_doc_infos(#state{} = State, Pairs, LocalDocs, _PurgeInfo) ->
+write_doc_infos(#state{} = State, Pairs, LocalDocs, PurgedIdRevs) ->
     #state{
         id_handle = IDHandle,
         seq_handle = SeqHandle,
@@ -470,10 +473,26 @@ write_doc_infos(#state{} = State, Pairs, LocalDocs, _PurgeInfo) ->
     #meta{
         deleted_doc_count = DelDocCount
     } = Meta,
-    NewMeta = Meta#meta{
-        deleted_doc_count = DelDocCount + length(RemIds),
-        update_seq = NewSeq
-    },
+    DeletedDocCount = DelDocCount + length(RemIds),
+
+    NewMeta = case PurgedIdRevs of
+        [] -> 
+            Meta#meta{
+                deleted_doc_count = DeletedDocCount,
+                update_seq = NewSeq
+            };
+        _ ->
+            #meta{
+                purge_seq = OldPurgeSeq
+                } = Meta,
+            Meta#meta{
+                deleted_doc_count = DeletedDocCount,
+                update_seq = NewSeq + 1,
+                purge_seq = OldPurgeSeq + 1,
+                last_purged = PurgedIdRevs
+            }
+    end,
+
     State1 = save_meta(State, NewMeta),
     case rocksdb:write_batch(DBHandle, Batch, []) of
         ok -> State1;
