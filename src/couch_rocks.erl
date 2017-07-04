@@ -11,7 +11,7 @@
 % the License.
 
 -module(couch_rocks).
-%-behavior(couch_db_engine).
+-behavior(couch_db_engine).
 
 % TODO:
 % * Implement epochs for node
@@ -23,16 +23,16 @@
     exists/1,
 
     delete/3,
-    % delete_compaction_files/3,
+    delete_compaction_files/3,
 
     init/2,
     terminate/2,
-    handle_call/2,
-    handle_info/2,
+    handle_db_updater_call/2,
+    handle_db_updater_info/2,
 
-    % incref/1,
-    % decref/1,
-    % monitored_by/1,
+    incref/1,
+    decref/1,
+    monitored_by/1,
 
     get_compacted_seq/1,
     get_del_doc_count/1,
@@ -69,38 +69,10 @@
     fold_changes/5,
     count_changes_since/2,
 
-    % start_compaction/4,
+    start_compaction/4,
     finish_compaction/4
 ]).
 
-
-% These are used by the compactor
-% -export([
-%     init_state/6,
-%     open_idx_data_files/3,
-%     read_header/2,
-%     write_header/3,
-%     update_header/2,
-%     write_doc_info/2
-% ]).
-
-
-% -export([
-%     id_seq_tree_split/2,
-%     id_seq_tree_join/3,
-
-%     id_tree_reduce/2,
-%     seq_tree_reduce/2,
-
-%     local_tree_split/2,
-%     local_tree_join/3
-% ]).
-
-% % Used by the compactor
-% -export([
-%     set_update_seq/2,
-%     copy_security/2
-% ]).
 
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_rocks.hrl").
@@ -175,30 +147,13 @@ open_db(File, Options) ->
                 db_handle = DBHandle,
                 doc_handle = DocHandle,
                 meta = Meta,
-                file_name = File
+                file_name = File,
+                db_pid = self()
                 },
             {ok, State};
         Err -> 
             throw(Err)
     end.
-
-% setup_new_db(CPFile, Options) ->
-%     {ok, State} = open_existing_db(CPFile, Options),
-%     #state{
-%         meta = Meta, 
-%         db_handle = DBHandle, 
-%         meta_handle = 
-%         MetaHandle
-%         } = State,
-    
-%     case rocksdb:put(DBHandle, MetaHandle, ?METABIN, term_to_binary(Meta), [{sync, true}]) of
-%             ok -> ok;
-%             Err -> throw(Err)
-%         end,
-%     State1 = State#state{
-%         meta = Meta
-%     },
-%     {ok, State1}.
 
 
 create_default_meta(DBHandle, MetaHandle, Options) ->
@@ -225,47 +180,33 @@ delete(_RootDir, DirPath, _Options) ->
     rocksdb:destroy(File, []).
 
 
-% delete_compaction_files(RootDir, DirPath, _DelOpts) ->
-%     nifile:lsdir(DirPath, fun(FName, _) ->
-%         FNameLen = size(FName),
-%         WithoutCompact = FNameLen - 8,
-%         case FName of
-%             <<_:WithoutCompact/binary, ".compact">> ->
-%                 couch_ngen_file:delete(RootDir, FName);
-%             _ ->
-%                 ok
-%         end
-%     end, nil).
+delete_compaction_files(_RootDir, _DirPath, _DelOpts) ->
+    ok.
 
 
-handle_call(Msg, St) ->
+handle_db_updater_call(Msg, St) ->
     {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
 
-
-handle_info({'DOWN', _, _, _, _}, St) ->
-    {stop, normal, St}.
-
-
-% incref(St) ->
-%     Monitors = [
-%         couch_ngen_file:monitor(St#st.idx_fd),
-%         couch_ngen_file:monitor(St#st.data_fd)
-%     ],
-%     {ok, St#st{fd_monitors = Monitors}}.
+handle_db_updater_info({'DOWN', Ref, _, _, _}, #state{db_monitor=Ref} = State) ->
+    {stop, normal, State#state{db_pid=undefined, db_monitor=closed}}.
 
 
-% decref(St) ->
-%     lists:foreach(fun(Ref) ->
-%         true = erlang:demonitor(Ref, [flush])
-%     end, St#st.fd_monitors),
-%     ok.
+incref(State) ->
+    {ok, State#state{db_monitor = erlang:monitor(process, State#state.db_pid)}}.
 
 
-% monitored_by(St) ->
-%     lists:foldl(fun(Fd, Acc) ->
-%         MB = couch_ngen_file:monitored_by(Fd),
-%         lists:umerge(lists:sort(MB), Acc)
-%     end, [], [St#st.cp_fd, St#st.idx_fd, St#st.data_fd]).
+decref(State) ->
+    true = erlang:demonitor(State#state.db_monitor, [flush]),
+    ok.
+
+
+monitored_by(#state{db_pid = DBPid}) ->
+    case erlang:process_info(DBPid, monitored_by) of
+        {monitored_by, Pids} ->
+            Pids;
+        _ ->
+            []
+    end.
 
 
 get_compacted_seq(State) ->
@@ -596,85 +537,12 @@ count_changes_since(State, SinceSeq) ->
 
 
 
-% start_compaction(St, DbName, Options, Parent) ->
-%     Args = [St, DbName, Options, Parent],
-%     Pid = spawn_link(couch_ngen_compactor, start, Args),
-%     {ok, St, Pid}.
+% RocksDB handles compaction itself
+start_compaction(State, _DbName, _Options, _Parent) ->
+    {ok, State, self()}.
 
 finish_compaction(_S, _D, _O, _D) ->
     ok.
-% finish_compaction(SrcSt, DbName, Options, DirPath) ->
-%     {ok, TgtSt1} = ?MODULE:init(DirPath, [compactor | Options]),
-%     SrcSeq = get_update_seq(SrcSt),
-%     TgtSeq = get_update_seq(TgtSt1),
-%     case SrcSeq == TgtSeq of
-%         true ->
-%             finish_compaction_int(SrcSt, TgtSt1);
-%         false ->
-%             couch_log:info("Compaction file still behind main file "
-%                            "(update seq=~p. compact update seq=~p). Retrying.",
-%                            [SrcSeq, TgtSeq]),
-%             ok = decref(TgtSt1),
-%             start_compaction(SrcSt, DbName, Options, self())
-%     end.
-
-
-% id_seq_tree_split({Key, Ptr}, _DataFd) ->
-%     {Key, Ptr}.
-
-
-% id_seq_tree_join(_Key, DiskPtr, DataFd) ->
-%     {ok, DiskTerm} = couch_ngen_file:read_term(DataFd, DiskPtr),
-%     {Id, Seq, Deleted, Sizes, DiskTree} = DiskTerm,
-%     #full_doc_info{
-%         id = Id,
-%         update_seq = Seq,
-%         deleted = ?i2b(Deleted),
-%         sizes = couch_db_updater:upgrade_sizes(Sizes),
-%         rev_tree = rev_tree(DiskTree)
-%     }.
-
-
-% id_tree_reduce(reduce, FullDocInfos) ->
-%     FoldFun = fun(Info, {Count, DelCount, Sizes}) ->
-%         Sizes2 = reduce_sizes(Sizes, Info#full_doc_info.sizes),
-%         case Info#full_doc_info.deleted of
-%             true -> {Count, DelCount + 1, Sizes2};
-%             false -> {Count + 1, DelCount, Sizes2}
-%         end
-%     end,
-%     lists:foldl(FoldFun, {0, 0, #size_info{}}, FullDocInfos);
-% id_tree_reduce(rereduce, Reds) ->
-%     FoldFun = fun({Count1, DelCount1, Sizes1}, {Count2, DelCount2, Sizes2}) ->
-%             Sizes3 = reduce_sizes(Sizes1, Sizes2),
-%             {Count1 + Count2, DelCount1 + DelCount2, Sizes3}
-%     end,
-%     lists:foldl(FoldFun, {0, 0, #size_info{}}, Reds).
-
-
-% seq_tree_reduce(reduce, DocInfos) ->
-%     % count the number of documents
-%     length(DocInfos);
-% seq_tree_reduce(rereduce, Reds) ->
-%     lists:sum(Reds).
-
-
-
-
-% increment_update_seq(#st{header = Header} = St) ->
-%     UpdateSeq = couch_ngen_header:get(Header, update_seq),
-%     St#st{
-%         header = couch_ngen_header:set(Header, [
-%             {update_seq, UpdateSeq + 1}
-%         ])
-%     }.
-
-
-
-% delete_compaction_files(DirPath) ->
-%     RootDir = config:get("couchdb", "database_dir", "."),
-%     delete_compaction_files(RootDir, DirPath, []).
-
 
 get_write_info(St, Pairs) ->
     Acc = #wiacc{update_seq = get_update_seq(St)},
@@ -722,88 +590,6 @@ get_write_info(St, [{OldFDI, NewFDI} | Rest], Acc) ->
     get_write_info(St, Rest, NewAcc).
 
 
-
-% rev_tree(DiskTree) ->
-%     couch_key_tree:map(fun
-%         (_RevId, {Del, Ptr, Seq}) ->
-%             #leaf{
-%                 deleted = ?i2b(Del),
-%                 ptr = Ptr,
-%                 seq = Seq
-%             };
-%         (_RevId, {Del, Ptr, Seq, Size}) ->
-%             #leaf{
-%                 deleted = ?i2b(Del),
-%                 ptr = Ptr,
-%                 seq = Seq,
-%                 sizes = couch_db_updater:upgrade_sizes(Size)
-%             };
-%         (_RevId, {Del, Ptr, Seq, Sizes, Atts}) ->
-%             #leaf{
-%                 deleted = ?i2b(Del),
-%                 ptr = Ptr,
-%                 seq = Seq,
-%                 sizes = couch_db_updater:upgrade_sizes(Sizes),
-%                 atts = Atts
-%             };
-%         (_RevId, ?REV_MISSING) ->
-%             ?REV_MISSING
-%     end, DiskTree).
-
-
-% disk_tree(RevTree) ->
-%     couch_key_tree:map(fun
-%         (_RevId, ?REV_MISSING) ->
-%             ?REV_MISSING;
-%         (_RevId, #leaf{} = Leaf) ->
-%             #leaf{
-%                 deleted = Del,
-%                 ptr = Ptr,
-%                 seq = Seq,
-%                 sizes = Sizes,
-%                 atts = Atts
-%             } = Leaf,
-%             {?b2i(Del), Ptr, Seq, split_sizes(Sizes), Atts}
-%     end, RevTree).
-
-
-% split_sizes(#size_info{}=SI) ->
-%     {SI#size_info.active, SI#size_info.external}.
-
-
-% reduce_sizes(nil, _) ->
-%     nil;
-% reduce_sizes(_, nil) ->
-%     nil;
-% reduce_sizes(#size_info{}=S1, #size_info{}=S2) ->
-%     #size_info{
-%         active = S1#size_info.active + S2#size_info.active,
-%         external = S1#size_info.external + S2#size_info.external
-%     };
-% reduce_sizes(S1, S2) ->
-%     US1 = couch_db_updater:upgrade_sizes(S1),
-%     US2 = couch_db_updater:upgrade_sizes(S2),
-%     reduce_sizes(US1, US2).
-
-
-% active_size(#st{} = St, Size) when is_integer(Size) ->
-%     active_size(St, #size_info{active=Size});
-% active_size(#st{} = St, #size_info{} = SI) ->
-%     Trees = [
-%         St#st.id_tree,
-%         St#st.seq_tree,
-%         St#st.local_tree
-%     ],
-%     lists:foldl(fun(T, Acc) ->
-%         case couch_ngen_btree:size(T) of
-%             _ when Acc == null ->
-%                 null;
-%             undefined ->
-%                 null;
-%             Size ->
-%                 Acc + Size
-%         end
-%     end, SI#size_info.active, Trees).
 
 
 fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
@@ -939,53 +725,3 @@ skip_deleted(UserFun) ->
             _ -> UserFun(Doc, Acc)
         end
     end.
-
-
-% finish_compaction_int(#st{} = OldSt, #st{} = NewSt1) ->
-%     #st{
-%         dirpath = DirPath,
-%         local_tree = OldLocal
-%     } = OldSt,
-%     #st{
-%         dirpath = DirPath,
-%         header = Header,
-%         local_tree = NewLocal1
-%     } = NewSt1,
-
-%     % suck up all the local docs into memory and write them to the new db
-%     LoadFun = fun(Value, _Offset, Acc) ->
-%         {ok, [Value | Acc]}
-%     end,
-%     {ok, _, LocalDocs} = couch_ngen_btree:foldl(OldLocal, LoadFun, []),
-%     {ok, NewLocal2} = couch_ngen_btree:add(NewLocal1, LocalDocs),
-
-%     {ok, NewSt2} = commit_data(NewSt1#st{
-%         header = couch_bt_engine_header:set(Header, [
-%             {compacted_seq, get_update_seq(OldSt)},
-%             {revs_limit, get_revs_limit(OldSt)}
-%         ]),
-%         local_tree = NewLocal2
-%     }),
-
-%     % Move our compaction files into place
-%     ok = remove_compact_suffix(NewSt2#st.idx_fd),
-%     ok = remove_compact_suffix(NewSt2#st.data_fd),
-%     ok = delete_fd(NewSt2#st.idx_fd),
-
-%     % Remove the old database files
-%     ok = delete_fd(OldSt#st.data_fd),
-%     ok = delete_fd(OldSt#st.idx_fd),
-%     ok = delete_fd(OldSt#st.cp_fd),
-
-%     % Final swap to finish compaction
-%     ok = remove_compact_suffix(NewSt2#st.cp_fd),
-
-%     decref(OldSt),
-%     {ok, NewSt2, undefined}.
-
-
-% remove_compact_suffix(Fd) ->
-%     Path = couch_ngen_file:path(Fd),
-%     PathWithoutCompact = size(Path) - size(<<".compact">>),
-%     <<FileName:PathWithoutCompact/binary, ".compact">> = Path,
-%     couch_ngen_file:rename(Fd, FileName).
