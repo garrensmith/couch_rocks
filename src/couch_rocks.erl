@@ -109,17 +109,17 @@
 
 
 exists(DirPath) ->
-    CPFile = DirPath ++ ".rocks",
-    filelib:is_dir(CPFile).
+    filelib:is_dir(DirPath).
 
 init(DirPath, Options) ->
-    CPFile = DirPath ++ ".rocks",
+    CPFile = DirPath,
     Create = lists:member(create, Options),
     RocksDefaultOptions = [{create_if_missing, true}, {create_missing_column_families, true}],
     {ok, State} = case exists(DirPath) of 
         false when Create =:= false -> 
             throw({not_found, no_db_file});
         false ->
+            filelib:ensure_dir(CPFile),
             open_db(CPFile, lists:append(Options, RocksDefaultOptions));
         true when Create =:= true -> 
             throw({error, eexist});
@@ -593,9 +593,8 @@ get_write_info(St, [{OldFDI, NewFDI} | Rest], Acc) ->
 
 
 fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
-    %I'm not 100% certain around the reduce work, I need to follow up on that
     {Reduce, Acc0} = case lists:member(include_reductions, Options) of 
-        true -> {true, {[],UserAcc}};
+        true -> {true, {{[],[]},UserAcc}};
         _ -> {false, UserAcc}
     end,
 
@@ -605,26 +604,30 @@ fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
         false when Reduce =:= false -> skip_deleted(UserFun)
     end,
 
-    case rocksdb:iterator(DBHandle, CFHandle, []) of
-        {ok, Iter} ->
-            try
-                {ok, StartKey, EndKey, Direction} = get_iter_range(Options),
-                {ok, Acc} = fold_loop(rocksdb:iterator_move(Iter, StartKey), Iter, Direction, EndKey, Reduce, FoldFun, Acc0),
-                case Reduce of
-                    true -> 
-                        {Red, FinalAcc} = Acc,
+    case rocksdb:snapshot(DBHandle) of
+        {error, Err} -> 
+                throw(Err);
+        {ok, Snapshot} ->
+            case rocksdb:iterator(DBHandle, CFHandle, [{snapshot, Snapshot}]) of
+                {ok, Iter} ->
+                    try
+                        {ok, StartKey, EndKey, Direction} = get_iter_range(Options),
+                        {ok, Acc} = fold_loop(rocksdb:iterator_move(Iter, StartKey), Iter, Direction, EndKey, Reduce, FoldFun, Acc0),
+                        case Reduce of
+                            true -> 
+                                {Red, FinalAcc} = Acc,
+                                {ok, fold_docs_reduce_to_count(Red), FinalAcc};
+                            _  -> 
+                                {ok, Acc}
+                        end
+                    after
+                        rocksdb:release_snapshot(Snapshot),
+                        rocksdb:iterator_close(Iter)
+                    end;
 
-                        {ok, lists:sum(Red), FinalAcc};
-                    _  -> 
-                        {ok, Acc}
-                end
-            after
-                rocksdb:iterator_move(Iter, next),
-                rocksdb:iterator_close(Iter)
-            end;
-
-        {error, Err} ->
-            throw(Err)
+                {error, Err} ->
+                    throw(Err)
+        end
     end.
 
 
@@ -725,3 +728,43 @@ skip_deleted(UserFun) ->
             _ -> UserFun(Doc, Acc)
         end
     end.
+
+%Taken out of couch_bt_engine, not pretty but it seems to work
+fold_docs_reduce_to_count(Reds) ->
+    RedFun = fun id_tree_reduce/2,
+    FinalRed = couch_btree:final_reduce(RedFun, Reds),
+    element(1, FinalRed).
+
+id_tree_reduce(reduce, FullDocInfos) ->
+    lists:foldl(fun(Info, {NotDeleted, Deleted, Sizes}) ->
+        Sizes2 = reduce_sizes(Sizes, Info#full_doc_info.sizes),
+        case Info#full_doc_info.deleted of
+        true ->
+            {NotDeleted, Deleted + 1, Sizes2};
+        false ->
+            {NotDeleted + 1, Deleted, Sizes2}
+        end
+    end, {0, 0, #size_info{}}, FullDocInfos);
+id_tree_reduce(rereduce, Reds) ->
+    lists:foldl(fun
+        ({NotDeleted, Deleted}, {AccNotDeleted, AccDeleted, _AccSizes}) ->
+            % pre 1.2 format, will be upgraded on compaction
+            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, nil};
+        ({NotDeleted, Deleted, Sizes}, {AccNotDeleted, AccDeleted, AccSizes}) ->
+            AccSizes2 = reduce_sizes(AccSizes, Sizes),
+            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, AccSizes2}
+    end, {0, 0, #size_info{}}, Reds).
+
+reduce_sizes(nil, _) ->
+    nil;
+reduce_sizes(_, nil) ->
+    nil;
+reduce_sizes(#size_info{}=S1, #size_info{}=S2) ->
+    #size_info{
+        active = S1#size_info.active + S2#size_info.active,
+        external = S1#size_info.external + S2#size_info.external
+    };
+reduce_sizes(S1, S2) ->
+    US1 = couch_db_updater:upgrade_sizes(S1),
+    US2 = couch_db_updater:upgrade_sizes(S2),
+    reduce_sizes(US1, US2).
