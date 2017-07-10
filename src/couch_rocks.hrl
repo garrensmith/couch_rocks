@@ -13,7 +13,7 @@
 -record(state, {
     db_handle,
     db_monitor,
-    db_pid,
+    mon_pid,
     id_handle,
     seq_handle,
     meta_handle,
