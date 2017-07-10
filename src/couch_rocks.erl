@@ -73,6 +73,9 @@
     finish_compaction/4
 ]).
 
+%needed for the monitoring api calls
+-export[mon_loop/0].
+
 
 -include_lib("couch/include/couch_db.hrl").
 -include("couch_rocks.hrl").
@@ -148,7 +151,7 @@ open_db(File, Options) ->
                 doc_handle = DocHandle,
                 meta = Meta,
                 file_name = File,
-                db_pid = self()
+                mon_pid = spawn_link(?MODULE, mon_loop, [])
                 },
             {ok, State};
         Err -> 
@@ -188,11 +191,11 @@ handle_db_updater_call(Msg, St) ->
     {stop, {invalid_call, Msg}, {invalid_call, Msg}, St}.
 
 handle_db_updater_info({'DOWN', Ref, _, _, _}, #state{db_monitor=Ref} = State) ->
-    {stop, normal, State#state{db_pid=undefined, db_monitor=closed}}.
+    {stop, normal, State#state{mon_pid=undefined, db_monitor=closed}}.
 
 
 incref(State) ->
-    {ok, State#state{db_monitor = erlang:monitor(process, State#state.db_pid)}}.
+    {ok, State#state{db_monitor = erlang:monitor(process, State#state.mon_pid)}}.
 
 
 decref(State) ->
@@ -200,14 +203,17 @@ decref(State) ->
     ok.
 
 
-monitored_by(#state{db_pid = DBPid}) ->
-    case erlang:process_info(DBPid, monitored_by) of
+monitored_by(#state{mon_pid = MonPid}) ->
+    case erlang:process_info(MonPid, monitored_by) of
         {monitored_by, Pids} ->
             Pids;
         _ ->
             []
     end.
 
+mon_loop() ->
+    receive _ -> ok end,
+    mon_loop().
 
 get_compacted_seq(State) ->
     #meta{compacted_seq = CompactSeq} = get_meta_info(State),
@@ -593,11 +599,7 @@ get_write_info(St, [{OldFDI, NewFDI} | Rest], Acc) ->
 
 
 fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
-    {Reduce, Acc0} = case lists:member(include_reductions, Options) of 
-        true -> {true, {{[],[]},UserAcc}};
-        _ -> {false, UserAcc}
-    end,
-
+    Reduce = lists:member(include_reductions, Options),
     FoldFun = case lists:member(include_deleted, Options) of
         true -> UserFun;
         false when Reduce =:= true -> skip_deleted_with_reduce(UserFun);
@@ -612,11 +614,10 @@ fold_docs_int(DBHandle, CFHandle, UserFun, UserAcc, Options) ->
                 {ok, Iter} ->
                     try
                         {ok, StartKey, EndKey, Direction} = get_iter_range(Options),
-                        {ok, Acc} = fold_loop(rocksdb:iterator_move(Iter, StartKey), Iter, Direction, EndKey, Reduce, FoldFun, Acc0),
+                        {ok, Acc} = fold_loop(rocksdb:iterator_move(Iter, StartKey), Iter, Direction, EndKey, Reduce, FoldFun, UserAcc),
                         case Reduce of
                             true -> 
-                                {Red, FinalAcc} = Acc,
-                                {ok, fold_docs_reduce_to_count(Red), FinalAcc};
+                                {ok, 0, Acc};
                             _  -> 
                                 {ok, Acc}
                         end
@@ -654,9 +655,7 @@ fold_loop({ok, Key, _Value}, _Iter, Direction, {EndKey, Inclusive}, _Reduce, _Fu
 fold_loop({ok, _Key, Value}, Iter, Direction, EndKey, Reduce, Fun, Acc0) ->
     {Go, Acc2} = case Reduce of
         true ->
-            {Red, Acc1} = Acc0,
-            {Go0, AccOut} = Fun(binary_to_term(Value), Red, Acc1),
-            {Go0, {Red, AccOut}};
+            Fun(binary_to_term(Value), {[],[]}, Acc0);
         _ ->
             Fun(binary_to_term(Value), Acc0)
     end,
@@ -728,43 +727,3 @@ skip_deleted(UserFun) ->
             _ -> UserFun(Doc, Acc)
         end
     end.
-
-%Taken out of couch_bt_engine, not pretty but it seems to work
-fold_docs_reduce_to_count(Reds) ->
-    RedFun = fun id_tree_reduce/2,
-    FinalRed = couch_btree:final_reduce(RedFun, Reds),
-    element(1, FinalRed).
-
-id_tree_reduce(reduce, FullDocInfos) ->
-    lists:foldl(fun(Info, {NotDeleted, Deleted, Sizes}) ->
-        Sizes2 = reduce_sizes(Sizes, Info#full_doc_info.sizes),
-        case Info#full_doc_info.deleted of
-        true ->
-            {NotDeleted, Deleted + 1, Sizes2};
-        false ->
-            {NotDeleted + 1, Deleted, Sizes2}
-        end
-    end, {0, 0, #size_info{}}, FullDocInfos);
-id_tree_reduce(rereduce, Reds) ->
-    lists:foldl(fun
-        ({NotDeleted, Deleted}, {AccNotDeleted, AccDeleted, _AccSizes}) ->
-            % pre 1.2 format, will be upgraded on compaction
-            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, nil};
-        ({NotDeleted, Deleted, Sizes}, {AccNotDeleted, AccDeleted, AccSizes}) ->
-            AccSizes2 = reduce_sizes(AccSizes, Sizes),
-            {AccNotDeleted + NotDeleted, AccDeleted + Deleted, AccSizes2}
-    end, {0, 0, #size_info{}}, Reds).
-
-reduce_sizes(nil, _) ->
-    nil;
-reduce_sizes(_, nil) ->
-    nil;
-reduce_sizes(#size_info{}=S1, #size_info{}=S2) ->
-    #size_info{
-        active = S1#size_info.active + S2#size_info.active,
-        external = S1#size_info.external + S2#size_info.external
-    };
-reduce_sizes(S1, S2) ->
-    US1 = couch_db_updater:upgrade_sizes(S1),
-    US2 = couch_db_updater:upgrade_sizes(S2),
-    reduce_sizes(US1, US2).
